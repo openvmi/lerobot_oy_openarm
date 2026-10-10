@@ -14,6 +14,15 @@ The distribution and import package are both named
 `lerobot_robot_oy_openarm`, so LeRobot's `register_third_party_plugins()` can
 discover and import the plugin automatically.
 
+With the standard `lerobot-record` command, the plugin moves Foxglove logging
+onto a latest-frame background dispatcher. Slow visualization can drop
+display-only frames without blocking dataset collection or robot control. The
+display publisher targets 30 FPS by default and can be configured with
+`OY_OPENARM_FOXGLOVE_MAX_FPS`. Use
+`--display_compressed_images=true` for multi-camera visualization; the plugin
+also keeps the channel type consistent between recording and episode reset
+loops on LeRobot 0.6.
+
 ## Usage
 
 ```bash

@@ -18,11 +18,18 @@ from .config_oy_openarm_follower import (
     OyOpenArmFollowerConfig,
     OyOpenArmFollowerConfigBase,
 )
+from .foxglove_async import install_async_foxglove_logging
 from .oy_openarm_follower import OY_OPENARM_POSITION_FEATURES, OyOpenArmFollower
+
+# ``lerobot-record`` imports its visualization functions before discovering
+# third-party plugins.  Installing here lets the standard command keep
+# Foxglove work out of the 30 Hz control loop without modifying LeRobot itself.
+install_async_foxglove_logging()
 
 __all__ = [
     "OY_OPENARM_POSITION_FEATURES",
     "OyOpenArmFollower",
     "OyOpenArmFollowerConfig",
     "OyOpenArmFollowerConfigBase",
+    "install_async_foxglove_logging",
 ]
