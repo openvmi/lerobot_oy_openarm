@@ -84,7 +84,9 @@ def _get_active_oy_openarm_leader() -> Any:
     return leader
 
 
-def _linear_map(value: float, source: tuple[float, float], target: tuple[float, float]) -> float:
+def _linear_map(
+    value: float, source: tuple[float, float], target: tuple[float, float]
+) -> float:
     """将数值从一个线性区间等比例映射到另一个线性区间。"""
 
     ratio = (value - source[0]) / (source[1] - source[0])
@@ -156,8 +158,12 @@ class OyOpenArmFollower(Robot):
         target = f"{self.config.ip}:{self.config.port}"
         logger.info("正在将 %s 连接到 OpenArm RCG：%s", self, target)
         try:
-            self._client = self._sdk.OpenArmClient(target, default_timeout=self.config.rpc_timeout)
-            self._client.wait_until_channel_ready(timeout=self.config.connection_timeout)
+            self._client = self._sdk.OpenArmClient(
+                target, default_timeout=self.config.rpc_timeout
+            )
+            self._client.wait_until_channel_ready(
+                timeout=self.config.connection_timeout
+            )
             self.configure()
             for camera in self.cameras.values():
                 camera.connect()
@@ -191,6 +197,7 @@ class OyOpenArmFollower(Robot):
         rate_hz: float = 50.0,
         max_velocity_rad_s: float = math.radians(20.0),
         position_tolerance_rad: float = math.radians(2.0),
+        gripper_tolerance_m: float = 0.002,
         settle_timeout_s: float = 3.0,
     ) -> None:
         """将从臂平滑移动到主臂当前角度，完成遥操作前的主从姿态对齐。
@@ -206,22 +213,30 @@ class OyOpenArmFollower(Robot):
             duration_s: 对齐轨迹的最短执行时间，单位为秒。
             rate_hz: 对齐轨迹的动作发送频率，单位为赫兹。
             max_velocity_rad_s: 任一关节允许的最大平均角速度，单位为弧度每秒。
-            position_tolerance_rad: 判断对齐完成所允许的最大位置误差，单位为弧度。
+            position_tolerance_rad: 判断七个旋转关节对齐完成所允许的最大误差，单位为弧度。
+            gripper_tolerance_m: 判断夹爪对齐完成所允许的最大物理行程误差，单位为米。
             settle_timeout_s: 轨迹结束后等待从臂到位的最长时间，单位为秒。
         """
 
         if action_pos is None:
-            raise ValueError("调用 calibrate() 时必须通过 action_pos 传入主臂的当前关节角度。")
+            raise ValueError(
+                "调用 calibrate() 时必须通过 action_pos 传入主臂的当前关节角度。"
+            )
 
         numeric_arguments = {
             "duration_s": duration_s,
             "rate_hz": rate_hz,
             "max_velocity_rad_s": max_velocity_rad_s,
             "position_tolerance_rad": position_tolerance_rad,
+            "gripper_tolerance_m": gripper_tolerance_m,
             "settle_timeout_s": settle_timeout_s,
         }
         for name, value in numeric_arguments.items():
-            if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(float(value)):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(float(value))
+            ):
                 raise ValueError(f"参数 {name} 必须是有限数值。")
             if value <= 0:
                 raise ValueError(f"参数 {name} 必须大于 0。")
@@ -237,7 +252,8 @@ class OyOpenArmFollower(Robot):
         self._submit_action(current, include_end_effectors=False, wait_for_publish=True)
 
         maximum_distance_rad = max(
-            abs(float(target[key]) - float(current[key])) for key in self.action_features
+            abs(float(target[key]) - float(current[key]))
+            for key in self.action_features
         )
         velocity_limited_duration_s = maximum_distance_rad / float(max_velocity_rad_s)
         actual_duration_s = max(float(duration_s), velocity_limited_duration_s)
@@ -253,7 +269,8 @@ class OyOpenArmFollower(Robot):
         for step in range(1, steps + 1):
             ratio = step / steps
             interpolated = {
-                key: float(current[key]) + ratio * (float(target[key]) - float(current[key]))
+                key: float(current[key])
+                + ratio * (float(target[key]) - float(current[key]))
                 for key in self.action_features
             }
             self._submit_action(interpolated)
@@ -262,23 +279,70 @@ class OyOpenArmFollower(Robot):
             time.sleep(max(0.0, next_deadline - time.perf_counter()))
 
         settle_deadline = time.perf_counter() + float(settle_timeout_s)
-        max_error = math.inf
         while True:
             actual = self._read_position_observation()
-            errors = {key: abs(float(target[key]) - float(actual[key])) for key in self.action_features}
-            max_error = max(errors.values())
-            if max_error <= float(position_tolerance_rad):
-                logger.info("主从臂角度对齐完成，最大位置误差为 %.6f 弧度", max_error)
+            joint_errors_rad = {
+                f"{side}_{joint}.pos": abs(
+                    float(target[f"{side}_{joint}.pos"])
+                    - float(actual[f"{side}_{joint}.pos"])
+                )
+                for side in ("left", "right")
+                for joint in JOINT_NAMES
+            }
+            gripper_errors_m = {
+                f"{side}_gripper.pos": abs(
+                    self._gripper_to_metres(
+                        side,
+                        arm,
+                        float(target[f"{side}_gripper.pos"]),
+                    )
+                    - self._gripper_to_metres(
+                        side,
+                        arm,
+                        float(actual[f"{side}_gripper.pos"]),
+                    )
+                )
+                for side, arm in (
+                    ("left", self._sdk.Arm.LEFT),
+                    ("right", self._sdk.Arm.RIGHT),
+                )
+            }
+            max_joint_error_rad = max(joint_errors_rad.values())
+            max_gripper_error_m = max(gripper_errors_m.values())
+            if max_joint_error_rad <= float(
+                position_tolerance_rad
+            ) and max_gripper_error_m <= float(gripper_tolerance_m):
+                logger.info(
+                    "主从臂角度对齐完成：最大关节误差 %.6f 弧度，最大夹爪误差 %.3f 毫米",
+                    max_joint_error_rad,
+                    max_gripper_error_m * 1000.0,
+                )
                 return
 
             now = time.perf_counter()
             if now >= settle_deadline:
-                worst_key = max(errors, key=errors.get)
-                raise TimeoutError(
-                    "主从臂角度对齐超时："
-                    f"{worst_key} 的误差为 {errors[worst_key]:.6f} 弧度，"
-                    f"允许误差为 {float(position_tolerance_rad):.6f} 弧度。"
+                joint_violations = [
+                    (
+                        error / float(position_tolerance_rad),
+                        f"{key} 的误差为 {error:.6f} 弧度，"
+                        f"允许误差为 {float(position_tolerance_rad):.6f} 弧度。",
+                    )
+                    for key, error in joint_errors_rad.items()
+                    if error > float(position_tolerance_rad)
+                ]
+                gripper_violations = [
+                    (
+                        error / float(gripper_tolerance_m),
+                        f"{key} 的误差为 {error * 1000.0:.3f} 毫米，"
+                        f"允许误差为 {float(gripper_tolerance_m) * 1000.0:.3f} 毫米。",
+                    )
+                    for key, error in gripper_errors_m.items()
+                    if error > float(gripper_tolerance_m)
+                ]
+                _, worst_error = max(
+                    joint_violations + gripper_violations, key=lambda item: item[0]
                 )
+                raise TimeoutError(f"主从臂角度对齐超时：{worst_error}")
 
             # 等待到位期间持续刷新最终目标，避免 SDK 的动作看门狗使会话过期。
             self._submit_action(target)
@@ -291,13 +355,17 @@ class OyOpenArmFollower(Robot):
             raise RuntimeError("OpenArm SDK 客户端尚未连接。")
 
         status = self._client.system.get_status(timeout=self.config.rpc_timeout)
-        if self.config.require_robot_ready and (not status.server_ready or not status.robot_ready):
+        if self.config.require_robot_ready and (
+            not status.server_ready or not status.robot_ready
+        ):
             raise RuntimeError(
                 "OpenArm RCG 可以访问，但尚未就绪："
                 f"server_ready={status.server_ready}, robot_ready={status.robot_ready}。"
             )
 
-        snapshot = self._client.end_effectors.get_info(self._sdk.Arm.BOTH, timeout=self.config.rpc_timeout)
+        snapshot = self._client.end_effectors.get_info(
+            self._sdk.Arm.BOTH, timeout=self.config.rpc_timeout
+        )
         if not snapshot.success:
             raise RuntimeError(f"无法查询 OpenArm 末端执行器：{snapshot.message}")
 
@@ -306,17 +374,30 @@ class OyOpenArmFollower(Robot):
         for arm in (self._sdk.Arm.LEFT, self._sdk.Arm.RIGHT):
             info = by_arm.get(arm)
             if info is None:
-                raise RuntimeError(f"OpenArm 未返回 {arm.name.lower()} 侧末端执行器信息。")
+                raise RuntimeError(
+                    f"OpenArm 未返回 {arm.name.lower()} 侧末端执行器信息。"
+                )
             if info.position_unit is not self._sdk.PositionUnit.METER:
                 raise RuntimeError(
                     f"{arm.name.lower()} 侧末端执行器使用 {info.position_unit.name} 单位，"
                     "但连续关节伺服接口要求夹爪目标使用米。"
                 )
-            if len(info.joint_names) != 1 or len(info.min_positions) != 1 or len(info.max_positions) != 1:
-                raise RuntimeError(f"{arm.name.lower()} 侧末端执行器必须只提供一个位置量。")
+            if (
+                len(info.joint_names) != 1
+                or len(info.min_positions) != 1
+                or len(info.max_positions) != 1
+            ):
+                raise RuntimeError(
+                    f"{arm.name.lower()} 侧末端执行器必须只提供一个位置量。"
+                )
             bounds = (float(info.min_positions[0]), float(info.max_positions[0]))
-            if not all(math.isfinite(value) for value in bounds) or bounds[0] >= bounds[1]:
-                raise RuntimeError(f"OpenArm 返回的 {arm.name.lower()} 侧夹爪范围无效：{bounds}")
+            if (
+                not all(math.isfinite(value) for value in bounds)
+                or bounds[0] >= bounds[1]
+            ):
+                raise RuntimeError(
+                    f"OpenArm 返回的 {arm.name.lower()} 侧夹爪范围无效：{bounds}"
+                )
             side = arm.name.lower()
             if getattr(self.config, f"{side}_gripper_inverted"):
                 bounds = (bounds[1], bounds[0])
@@ -327,7 +408,11 @@ class OyOpenArmFollower(Robot):
         """按照左右臂枚举整理 SDK 状态，并检查两侧状态是否完整。"""
 
         by_arm = {state.arm: state for state in states}
-        missing = [arm.name.lower() for arm in (self._sdk.Arm.LEFT, self._sdk.Arm.RIGHT) if arm not in by_arm]
+        missing = [
+            arm.name.lower()
+            for arm in (self._sdk.Arm.LEFT, self._sdk.Arm.RIGHT)
+            if arm not in by_arm
+        ]
         if missing:
             raise RuntimeError(f"OpenArm 的 {kind} 响应缺少以下机械臂：{missing}")
         return by_arm
@@ -341,38 +426,53 @@ class OyOpenArmFollower(Robot):
     def _gripper_to_metres(self, side: str, arm: Any, value_rad: float) -> float:
         """将 LeRobot 使用的夹爪弧度值映射为 SDK 连续伺服所需的米制值。"""
 
-        return _linear_map(value_rad, self._angular_gripper_bounds(side), self._gripper_ranges_m[arm])
+        return _linear_map(
+            value_rad, self._angular_gripper_bounds(side), self._gripper_ranges_m[arm]
+        )
 
     def _gripper_to_radians(self, side: str, arm: Any, value_m: float) -> float:
         """将 SDK 返回的夹爪米制位置反向映射为 LeRobot 使用的弧度值。"""
 
-        return _linear_map(value_m, self._gripper_ranges_m[arm], self._angular_gripper_bounds(side))
+        return _linear_map(
+            value_m, self._gripper_ranges_m[arm], self._angular_gripper_bounds(side)
+        )
 
     def _read_position_observation(self) -> RobotObservation:
         """只读取双臂关节和夹爪位置，不触发相机采集。"""
 
         joint_states = self._states_by_arm(
-            self._client.state.get_joint_states(self._sdk.Arm.BOTH, timeout=self.config.rpc_timeout),
+            self._client.state.get_joint_states(
+                self._sdk.Arm.BOTH, timeout=self.config.rpc_timeout
+            ),
             "关节状态",
         )
         end_snapshot = self._client.end_effectors.get_state(
             self._sdk.Arm.BOTH, timeout=self.config.rpc_timeout
         )
         if not end_snapshot.success:
-            raise RuntimeError(f"无法读取 OpenArm 末端执行器状态：{end_snapshot.message}")
+            raise RuntimeError(
+                f"无法读取 OpenArm 末端执行器状态：{end_snapshot.message}"
+            )
         end_states = self._states_by_arm(end_snapshot.states, "末端执行器状态")
 
         position_observation: RobotObservation = {}
         for side, arm in (("left", self._sdk.Arm.LEFT), ("right", self._sdk.Arm.RIGHT)):
             positions = joint_states[arm].positions_rad
             if len(positions) != len(JOINT_NAMES):
-                raise RuntimeError(f"OpenArm {side} 侧关节状态包含 {len(positions)} 个位置值，应为 7 个。")
+                raise RuntimeError(
+                    f"OpenArm {side} 侧关节状态包含 {len(positions)} 个位置值，应为 7 个。"
+                )
             for joint, value in zip(JOINT_NAMES, positions, strict=True):
                 position_observation[f"{side}_{joint}.pos"] = float(value)
 
             end_state = end_states[arm]
-            if not end_state.valid or end_state.position_unit is not self._sdk.PositionUnit.METER:
-                raise RuntimeError(f"OpenArm {side} 侧夹爪状态无效或未使用米制单位：{end_state.message}")
+            if (
+                not end_state.valid
+                or end_state.position_unit is not self._sdk.PositionUnit.METER
+            ):
+                raise RuntimeError(
+                    f"OpenArm {side} 侧夹爪状态无效或未使用米制单位：{end_state.message}"
+                )
             if len(end_state.positions) != 1:
                 raise RuntimeError(f"OpenArm {side} 侧夹爪状态必须只包含一个位置值。")
             position_observation[f"{side}_gripper.pos"] = self._gripper_to_radians(
@@ -394,7 +494,9 @@ class OyOpenArmFollower(Robot):
             if getattr(cfg, "use_depth", False):
                 observation[f"{name}_depth"] = camera.read_latest_depth()
 
-        logger.debug("%s 读取观测耗时 %.1f 毫秒", self, (time.perf_counter() - started_at) * 1e3)
+        logger.debug(
+            "%s 读取观测耗时 %.1f 毫秒", self, (time.perf_counter() - started_at) * 1e3
+        )
         return observation
 
     def _validated_action(self, action: RobotAction) -> RobotAction:
@@ -404,7 +506,9 @@ class OyOpenArmFollower(Robot):
         if action.keys() != expected:
             missing = sorted(expected - action.keys())
             unexpected = sorted(action.keys() - expected)
-            raise ValueError(f"OY OpenArm 动作字段不匹配：缺少={missing}，多余={unexpected}")
+            raise ValueError(
+                f"OY OpenArm 动作字段不匹配：缺少={missing}，多余={unexpected}"
+            )
 
         result: RobotAction = {}
         for key, raw_value in action.items():
@@ -442,9 +546,13 @@ class OyOpenArmFollower(Robot):
 
         state = getattr(feedback, "state", None) if feedback is not None else None
         is_terminal = bool(getattr(state, "is_terminal", False))
-        success = bool(getattr(feedback, "success", True)) if feedback is not None else True
+        success = (
+            bool(getattr(feedback, "success", True)) if feedback is not None else True
+        )
         if is_terminal or not success:
-            message = str(getattr(feedback, "message", "")).strip() or "服务端未提供错误详情"
+            message = (
+                str(getattr(feedback, "message", "")).strip() or "服务端未提供错误详情"
+            )
             received = int(getattr(feedback, "last_received_sequence", 0))
             published = int(getattr(feedback, "last_published_sequence", 0))
             raise RuntimeError(
@@ -494,7 +602,11 @@ class OyOpenArmFollower(Robot):
 
         feedback = self._check_servo_session(session)
         command_timeout_ms = int(
-            getattr(feedback, "command_timeout_ms", self.config.servo_command_timeout_ms or 500)
+            getattr(
+                feedback,
+                "command_timeout_ms",
+                self.config.servo_command_timeout_ms or 500,
+            )
         )
         timeout_s = max(1.0, command_timeout_ms * 2 / 1000.0)
         deadline = time.perf_counter() + timeout_s
@@ -527,13 +639,19 @@ class OyOpenArmFollower(Robot):
         sent = self._validated_action(action)
         targets = {
             arm: tuple(sent[f"{side}_{joint}.pos"] for joint in JOINT_NAMES)
-            for side, arm in (("left", self._sdk.Arm.LEFT), ("right", self._sdk.Arm.RIGHT))
+            for side, arm in (
+                ("left", self._sdk.Arm.LEFT),
+                ("right", self._sdk.Arm.RIGHT),
+            )
         }
         end_effectors = None
         if include_end_effectors:
             end_effectors = {
                 arm: [self._gripper_to_metres(side, arm, sent[f"{side}_gripper.pos"])]
-                for side, arm in (("left", self._sdk.Arm.LEFT), ("right", self._sdk.Arm.RIGHT))
+                for side, arm in (
+                    ("left", self._sdk.Arm.LEFT),
+                    ("right", self._sdk.Arm.RIGHT),
+                )
             }
 
         # start() 可能阻塞较长时间，必须先确保会话 READY，再生成目标采样时间戳。

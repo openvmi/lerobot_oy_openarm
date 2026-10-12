@@ -103,7 +103,9 @@ class FakeClient:
         self.wait_until_channel_ready = MagicMock()
         self.close = MagicMock(side_effect=self._close)
         self.system = SimpleNamespace(
-            get_status=MagicMock(return_value=SimpleNamespace(server_ready=True, robot_ready=True))
+            get_status=MagicMock(
+                return_value=SimpleNamespace(server_ready=True, robot_ready=True)
+            )
         )
         infos = tuple(
             SimpleNamespace(
@@ -113,10 +115,17 @@ class FakeClient:
                 min_positions=(minimum,),
                 max_positions=(maximum,),
             )
-            for arm, minimum, maximum in ((Arm.RIGHT, 0.02, 0.06), (Arm.LEFT, 0.01, 0.05))
+            for arm, minimum, maximum in (
+                (Arm.RIGHT, 0.02, 0.06),
+                (Arm.LEFT, 0.01, 0.05),
+            )
         )
         self.end_effectors = SimpleNamespace(
-            get_info=MagicMock(return_value=SimpleNamespace(success=True, message="", end_effectors=infos)),
+            get_info=MagicMock(
+                return_value=SimpleNamespace(
+                    success=True, message="", end_effectors=infos
+                )
+            ),
             get_state=MagicMock(),
         )
         self.state = SimpleNamespace(get_joint_states=MagicMock())
@@ -153,8 +162,12 @@ def _action(value=0.0):
 
 
 def test_config_limit_dicts_are_not_shared(tmp_path):
-    first = OyOpenArmFollowerConfig(id="a", calibration_dir=tmp_path, ip="localhost", port="1")
-    second = OyOpenArmFollowerConfig(id="b", calibration_dir=tmp_path, ip="localhost", port="1")
+    first = OyOpenArmFollowerConfig(
+        id="a", calibration_dir=tmp_path, ip="localhost", port="1"
+    )
+    second = OyOpenArmFollowerConfig(
+        id="b", calibration_dir=tmp_path, ip="localhost", port="1"
+    )
     first.left_joint_limits["joint_1"] = (-1.0, 1.0)
     assert second.left_joint_limits["joint_1"] == (-75.0, 75.0)
 
@@ -171,7 +184,9 @@ def test_follower_action_schema_matches_oy_openarm_leader():
 
 def test_config_rejects_single_arm_mode(tmp_path):
     with pytest.raises(ValueError, match="controls both arms"):
-        OyOpenArmFollowerConfig(id="test", calibration_dir=tmp_path, ip="localhost", port="1", side="left")
+        OyOpenArmFollowerConfig(
+            id="test", calibration_dir=tmp_path, ip="localhost", port="1", side="left"
+        )
 
 
 def test_dynamic_factory_finds_oy_openarm_follower(tmp_path):
@@ -314,7 +329,9 @@ def test_failed_servo_session_is_reported_without_restart_loop(robot):
     )
     client.session.is_closed = True
 
-    with pytest.raises(RuntimeError, match="target watchdog expired.*received=1, published=0"):
+    with pytest.raises(
+        RuntimeError, match="target watchdog expired.*received=1, published=0"
+    ):
         robot.send_action(_action())
 
     client.joint_servo.start.assert_called_once()
@@ -343,7 +360,9 @@ def test_calibrate_smoothly_aligns_follower_to_leader_action(robot):
     leader_action["right_gripper.pos"] = -0.3
 
     with (
-        patch.object(robot, "_read_position_observation", side_effect=[current, leader_action]),
+        patch.object(
+            robot, "_read_position_observation", side_effect=[current, leader_action]
+        ),
         patch("lerobot_robot_oy_openarm.oy_openarm_follower.time.sleep"),
     ):
         robot.calibrate(
@@ -368,6 +387,72 @@ def test_calibrate_smoothly_aligns_follower_to_leader_action(robot):
     assert final_targets[Arm.RIGHT][0] == pytest.approx(0.1)
 
 
+def test_calibrate_uses_millimetres_for_gripper_tolerance(robot):
+    robot.connect()
+    target = _action(0.0)
+    current = _action(0.0)
+    actual = _action(0.0)
+    target_right_m = robot._gripper_to_metres(
+        "right", Arm.RIGHT, target["right_gripper.pos"]
+    )
+    actual["right_gripper.pos"] = robot._gripper_to_radians(
+        "right",
+        Arm.RIGHT,
+        target_right_m - 0.0019,
+    )
+    assert abs(actual["right_gripper.pos"] - target["right_gripper.pos"]) > 0.001
+
+    with (
+        patch.object(
+            robot, "_read_position_observation", side_effect=[current, actual]
+        ),
+        patch("lerobot_robot_oy_openarm.oy_openarm_follower.time.sleep"),
+    ):
+        robot.calibrate(
+            target,
+            duration_s=0.001,
+            rate_hz=1000.0,
+            max_velocity_rad_s=100.0,
+            position_tolerance_rad=0.001,
+            gripper_tolerance_m=0.002,
+            settle_timeout_s=0.01,
+        )
+
+
+def test_calibrate_reports_gripper_timeout_in_millimetres(robot):
+    robot.connect()
+    target = _action(0.0)
+    current = _action(0.0)
+    actual = _action(0.0)
+    target_right_m = robot._gripper_to_metres(
+        "right", Arm.RIGHT, target["right_gripper.pos"]
+    )
+    actual["right_gripper.pos"] = robot._gripper_to_radians(
+        "right",
+        Arm.RIGHT,
+        target_right_m - 0.0021,
+    )
+
+    with (
+        patch.object(
+            robot, "_read_position_observation", side_effect=[current, actual]
+        ),
+        patch("lerobot_robot_oy_openarm.oy_openarm_follower.time.sleep"),
+        pytest.raises(
+            TimeoutError, match=r"right_gripper\.pos.*2\.100 毫米.*2\.000 毫米"
+        ),
+    ):
+        robot.calibrate(
+            target,
+            duration_s=0.001,
+            rate_hz=1000.0,
+            max_velocity_rad_s=100.0,
+            position_tolerance_rad=0.001,
+            gripper_tolerance_m=0.002,
+            settle_timeout_s=1e-9,
+        )
+
+
 def test_calibrate_requires_leader_action(robot):
     robot.connect()
     with pytest.raises(ValueError, match="必须.*主臂"):
@@ -381,6 +466,7 @@ def test_calibrate_requires_leader_action(robot):
         ("rate_hz", -1.0),
         ("max_velocity_rad_s", 0.0),
         ("position_tolerance_rad", float("nan")),
+        ("gripper_tolerance_m", 0.0),
         ("settle_timeout_s", 0.0),
     ],
 )
@@ -425,8 +511,12 @@ def test_get_observation_uses_arm_ids_not_tuple_order(robot):
     assert observation["left_joint_7.pos"] == 7.0
     assert observation["right_joint_1.pos"] == 11.0
     assert observation["right_joint_7.pos"] == 17.0
-    assert observation["left_gripper.pos"] == pytest.approx(-32.5 * 3.141592653589793 / 180.0)
-    assert observation["right_gripper.pos"] == pytest.approx(-32.5 * 3.141592653589793 / 180.0)
+    assert observation["left_gripper.pos"] == pytest.approx(
+        -32.5 * 3.141592653589793 / 180.0
+    )
+    assert observation["right_gripper.pos"] == pytest.approx(
+        -32.5 * 3.141592653589793 / 180.0
+    )
     assert observation.keys() == OY_OPENARM_POSITION_FEATURES.keys()
 
 
@@ -435,7 +525,10 @@ def test_get_observation_uses_arm_ids_not_tuple_order(robot):
     [
         (lambda action: action.pop("left_joint_1.pos"), ValueError),
         (lambda action: action.__setitem__("unexpected.pos", 0.0), ValueError),
-        (lambda action: action.__setitem__("left_joint_1.pos", float("nan")), ValueError),
+        (
+            lambda action: action.__setitem__("left_joint_1.pos", float("nan")),
+            ValueError,
+        ),
         (lambda action: action.__setitem__("left_joint_1.pos", True), TypeError),
     ],
 )
@@ -451,7 +544,9 @@ def test_connect_failure_closes_client(robot):
     class FailingClient(FakeClient):
         def __init__(self, target, default_timeout):
             super().__init__(target, default_timeout)
-            self.wait_until_channel_ready = MagicMock(side_effect=TimeoutError("offline"))
+            self.wait_until_channel_ready = MagicMock(
+                side_effect=TimeoutError("offline")
+            )
 
     with (
         patch.object(FAKE_SDK, "OpenArmClient", FailingClient),
