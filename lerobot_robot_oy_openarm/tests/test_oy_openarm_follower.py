@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 from lerobot.robots.utils import make_robot_from_config
 from lerobot_robot_oy_openarm.config_oy_openarm_follower import OyOpenArmFollowerConfig
 from lerobot_robot_oy_openarm.oy_openarm_follower import (
@@ -288,6 +289,27 @@ def test_send_action_starts_one_dual_arm_session_and_maps_grippers(robot):
 
     robot.send_action(_action())
     client.joint_servo.start.assert_called_once()
+
+
+def test_send_action_accepts_scalar_tensors_from_lerobot_replay(robot):
+    robot.connect()
+    action = _action(torch.tensor(0.25))
+
+    sent = robot.send_action(action)
+
+    assert all(isinstance(value, float) for value in sent.values())
+    assert sent["left_joint_1.pos"] == pytest.approx(0.25)
+    args, _kwargs = FakeClient.instances[-1].session.send.call_args
+    assert args[0][Arm.LEFT][0] == pytest.approx(0.25)
+
+
+def test_send_action_rejects_non_scalar_tensor(robot):
+    robot.connect()
+    action = _action()
+    action["left_joint_1.pos"] = torch.tensor([0.1, 0.2])
+
+    with pytest.raises(TypeError, match="必须是单个数值"):
+        robot.send_action(action)
 
 
 def test_send_action_samples_timestamp_after_session_is_ready(robot):

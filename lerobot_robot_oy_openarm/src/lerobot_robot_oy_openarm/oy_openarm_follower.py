@@ -512,8 +512,23 @@ class OyOpenArmFollower(Robot):
 
         result: RobotAction = {}
         for key, raw_value in action.items():
+            # LeRobotDataset returns each replayed action value as a scalar
+            # torch.Tensor. NumPy scalars/one-element arrays expose the same
+            # ``item()`` protocol. Unwrap those values here so the robot
+            # boundary consistently works with plain Python numbers without
+            # importing either optional numerical package in this plugin.
+            if not isinstance(raw_value, Real):
+                item = getattr(raw_value, "item", None)
+                if callable(item):
+                    try:
+                        raw_value = item()
+                    except (TypeError, ValueError, RuntimeError) as error:
+                        raise TypeError(
+                            f"动作 action[{key!r}] 必须是单个数值。"
+                        ) from error
+
             if isinstance(raw_value, bool) or not isinstance(raw_value, Real):
-                raise TypeError(f"动作 action[{key!r}] 必须是数值。")
+                raise TypeError(f"动作 action[{key!r}] 必须是单个数值。")
             value = float(raw_value)
             if not math.isfinite(value):
                 raise ValueError(f"动作 action[{key!r}] 必须是有限数值。")
