@@ -41,7 +41,6 @@ from lerobot.utils import visualization_utils
 logger = logging.getLogger(__name__)
 
 _LogVisualization = Callable[..., None]
-_ShutdownVisualization = Callable[..., None]
 
 
 DEFAULT_MAX_FPS = 30.0
@@ -61,7 +60,9 @@ class _LatestFoxgloveDispatcher:
         self._minimum_interval_s = 1.0 / max_fps
         self._max_fps = max_fps
         self._condition = threading.Condition()
-        self._pending: tuple[dict[str, Any] | None, dict[str, Any] | None, bool] | None = None
+        self._pending: (
+            tuple[dict[str, Any] | None, dict[str, Any] | None, bool] | None
+        ) = None
         self._thread: threading.Thread | None = None
         self._stopping = False
         self._disabled = False
@@ -119,8 +120,8 @@ class _LatestFoxgloveDispatcher:
                     return
 
                 if self._last_log_finished_at is not None and not self._stopping:
-                    remaining_s = (
-                        self._minimum_interval_s - (time.monotonic() - self._last_log_finished_at)
+                    remaining_s = self._minimum_interval_s - (
+                        time.monotonic() - self._last_log_finished_at
                     )
                     if remaining_s > 0:
                         # Waiting on the condition, rather than sleeping, lets
@@ -144,7 +145,9 @@ class _LatestFoxgloveDispatcher:
                 # Visualization must never abort a robot-control or dataset
                 # recording session.  Disable it after one failure to avoid a
                 # high-rate exception loop, while leaving recording active.
-                logger.exception("Foxglove 后台可视化失败；本次录制将继续，但停止发送可视化数据。")
+                logger.exception(
+                    "Foxglove 后台可视化失败；本次录制将继续，但停止发送可视化数据。"
+                )
                 with self._condition:
                     self._disabled = True
                     self._pending = None
@@ -179,27 +182,23 @@ class _LatestFoxgloveDispatcher:
 
 
 _installed = False
-_original_log_visualization_data: _LogVisualization | None = None
-_original_shutdown_visualization: _ShutdownVisualization | None = None
-_dispatcher: _LatestFoxgloveDispatcher | None = None
 
 
 def install_async_foxglove_logging() -> None:
     """Patch an already-loaded ``lerobot-record`` module exactly once."""
 
-    global _dispatcher
     global _installed
-    global _original_log_visualization_data
-    global _original_shutdown_visualization
 
     if _installed:
         return
 
-    _original_log_visualization_data = visualization_utils.log_visualization_data
-    _original_shutdown_visualization = visualization_utils.shutdown_visualization
+    original_log = visualization_utils.log_visualization_data
+    original_shutdown = visualization_utils.shutdown_visualization
     configured_max_fps = os.environ.get("OY_OPENARM_FOXGLOVE_MAX_FPS")
     try:
-        max_fps = DEFAULT_MAX_FPS if configured_max_fps is None else float(configured_max_fps)
+        max_fps = (
+            DEFAULT_MAX_FPS if configured_max_fps is None else float(configured_max_fps)
+        )
         if max_fps <= 0:
             raise ValueError
     except ValueError:
@@ -209,7 +208,7 @@ def install_async_foxglove_logging() -> None:
             DEFAULT_MAX_FPS,
         )
         max_fps = DEFAULT_MAX_FPS
-    _dispatcher = _LatestFoxgloveDispatcher(_original_log_visualization_data, max_fps=max_fps)
+    dispatcher = _LatestFoxgloveDispatcher(original_log, max_fps=max_fps)
 
     def log_visualization_data(
         display_mode: str,
@@ -218,19 +217,19 @@ def install_async_foxglove_logging() -> None:
         compress_images: bool = False,
     ) -> None:
         if display_mode != "foxglove":
-            _original_log_visualization_data(
+            original_log(
                 display_mode,
                 observation=observation,
                 action=action,
                 compress_images=compress_images,
             )
             return
-        _dispatcher.submit(observation, action, compress_images)
+        dispatcher.submit(observation, action, compress_images)
 
     def shutdown_visualization(display_mode: str) -> None:
         if display_mode == "foxglove":
-            _dispatcher.close()
-        _original_shutdown_visualization(display_mode)
+            dispatcher.close()
+        original_shutdown(display_mode)
 
     # Patch the utility module for future imports and the references already
     # imported by the stock lerobot-record entry point.  Plugin registration is
@@ -244,4 +243,3 @@ def install_async_foxglove_logging() -> None:
         record_module.shutdown_visualization = shutdown_visualization
 
     _installed = True
-

@@ -88,6 +88,7 @@ class FakeSession:
             command_timeout_ms=500,
         )
         self.is_closed = True
+        return self.feedback
 
     def _cancel(self):
         self.is_closed = True
@@ -128,6 +129,9 @@ class FakeClient:
                 )
             ),
             get_state=MagicMock(),
+            move=MagicMock(
+                return_value=SimpleNamespace(success=True, message="completed")
+            ),
         )
         self.state = SimpleNamespace(get_joint_states=MagicMock())
         self.joint_servo = SimpleNamespace(start=MagicMock(return_value=self.session))
@@ -245,17 +249,11 @@ def test_connect_can_align_to_registered_leader(tmp_path):
         ),
     ):
         robot = OyOpenArmFollower(config)
-        alignment_session = FakeSession()
-
-        def align_side_effect(_action):
-            robot._servo_session = alignment_session
-
-        with patch.object(robot, "calibrate", side_effect=align_side_effect) as align:
+        with patch.object(robot, "calibrate") as align:
             robot.connect()
 
     leader.get_action.assert_called_once_with()
     align.assert_called_once_with(leader_action)
-    alignment_session.stop.assert_called_once_with(timeout=5.0)
     assert robot._servo_session is None
     assert robot.is_connected
     robot.disconnect()
@@ -378,12 +376,14 @@ def test_calibrate_smoothly_aligns_follower_to_leader_action(robot):
     current["left_gripper.pos"] = -0.5
     current["right_gripper.pos"] = -0.5
     leader_action = _action(0.1)
-    leader_action["left_gripper.pos"] = -0.3
-    leader_action["right_gripper.pos"] = -0.3
+    leader_action["left_gripper.pos"] = -0.5
+    leader_action["right_gripper.pos"] = -0.5
 
     with (
         patch.object(
-            robot, "_read_position_observation", side_effect=[current, leader_action]
+            robot,
+            "_read_position_observation",
+            side_effect=[current, leader_action, leader_action],
         ),
         patch("lerobot_robot_oy_openarm.oy_openarm_follower.time.sleep"),
     ):
@@ -403,10 +403,240 @@ def test_calibrate_smoothly_aligns_follower_to_leader_action(robot):
     assert hold_targets[Arm.LEFT][0] == pytest.approx(0.0)
     assert hold_targets[Arm.RIGHT][0] == pytest.approx(0.0)
     assert client.session.send.call_args_list[0].kwargs["end_effectors"] is None
+    assert client.session.send.call_args_list[1].kwargs["end_effectors"] is None
+    assert client.session.send.call_args_list[2].kwargs["end_effectors"] is None
     assert first_targets[Arm.LEFT][0] == pytest.approx(0.05)
     assert first_targets[Arm.RIGHT][0] == pytest.approx(0.05)
     assert final_targets[Arm.LEFT][0] == pytest.approx(0.1)
     assert final_targets[Arm.RIGHT][0] == pytest.approx(0.1)
+    client.session.stop.assert_called_once_with(timeout=5.0)
+    client.end_effectors.move.assert_not_called()
+    assert robot._servo_session is None
+
+
+def test_calibrate_aligns_grippers_before_arm_only_servo(robot):
+    robot.connect()
+    client = FakeClient.instances[-1]
+    current = _action(0.0)
+    target = _action(0.1)
+    target["left_gripper.pos"] = -0.4
+    target["right_gripper.pos"] = -0.4
+    left_aligned = current.copy()
+    left_aligned["left_gripper.pos"] = target["left_gripper.pos"]
+    grippers_aligned = left_aligned.copy()
+    grippers_aligned["right_gripper.pos"] = target["right_gripper.pos"]
+    events = []
+
+    original_stop = client.session.stop.side_effect
+
+    def stop_session(**kwargs):
+        events.append("servo_stopped")
+        return original_stop(**kwargs)
+
+    def move_gripper(arm, *_args, **_kwargs):
+        events.append(f"move_{arm.name.lower()}")
+        assert client.joint_servo.start.call_count == 0
+        return SimpleNamespace(success=True, message="completed")
+
+    client.session.stop.side_effect = stop_session
+    client.end_effectors.move.side_effect = move_gripper
+    with (
+        patch.object(
+            robot,
+            "_read_position_observation",
+            side_effect=[current, left_aligned, grippers_aligned, target, target],
+        ),
+        patch("lerobot_robot_oy_openarm.oy_openarm_follower.time.sleep"),
+    ):
+        robot.calibrate(
+            target,
+            duration_s=0.001,
+            rate_hz=1000.0,
+            max_velocity_rad_s=1000.0,
+            position_tolerance_rad=0.001,
+            settle_timeout_s=0.01,
+        )
+
+    assert events == ["move_left", "move_right", "servo_stopped"]
+    assert all(
+        call.kwargs["end_effectors"] is None
+        for call in client.session.send.call_args_list
+    )
+    assert client.end_effectors.move.call_args_list[0].args[0] is Arm.LEFT
+    assert client.end_effectors.move.call_args_list[1].args[0] is Arm.RIGHT
+    assert client.end_effectors.move.call_args_list[0].kwargs == {
+        "timeout": 15.0,
+        "info_timeout": 3.0,
+    }
+
+
+def test_calibrate_corrects_joint_drift_after_servo_stop(robot):
+    robot.connect()
+    client = FakeClient.instances[-1]
+    first_session = client.session
+    correction_session = FakeSession()
+    client.joint_servo.start.side_effect = [first_session, correction_session]
+
+    target = _action(0.0)
+    current = target.copy()
+    current["right_joint_5.pos"] = 0.1
+    drifted = target.copy()
+    drifted["right_joint_5.pos"] = 0.040499
+
+    with (
+        patch.object(
+            robot,
+            "_read_position_observation",
+            side_effect=[current, target, drifted, target, target],
+        ),
+        patch("lerobot_robot_oy_openarm.oy_openarm_follower.time.sleep"),
+    ):
+        robot.calibrate(
+            target,
+            duration_s=0.001,
+            rate_hz=1000.0,
+            max_velocity_rad_s=1000.0,
+            position_tolerance_rad=math.radians(2.0),
+            settle_timeout_s=0.01,
+        )
+
+    assert client.joint_servo.start.call_count == 2
+    assert first_session.feedback.state is STOPPED
+    assert correction_session.feedback.state is STOPPED
+    assert robot._servo_session is None
+
+
+def test_arm_alignment_keeps_stop_margin_inside_requested_tolerance(robot):
+    robot.connect()
+    session = FakeClient.instances[-1].session
+    target = _action(0.0)
+    current = target.copy()
+    current["right_joint_5.pos"] = 0.1
+    near_target = target.copy()
+    near_target["right_joint_5.pos"] = 0.03
+
+    with (
+        patch.object(
+            robot,
+            "_read_position_observation",
+            side_effect=[near_target, target],
+        ),
+        patch("lerobot_robot_oy_openarm.oy_openarm_follower.time.sleep"),
+    ):
+        robot._align_arm_joints(
+            current=current,
+            target=target,
+            duration_s=0.001,
+            rate_hz=1000.0,
+            max_velocity_rad_s=1000.0,
+            position_tolerance_rad=math.radians(2.0),
+            settle_timeout_s=0.01,
+        )
+
+    # 0.03 rad is inside the requested 2° tolerance but outside the internal
+    # 1.5° stop margin, so the final target must be refreshed once more.
+    assert session.send.call_count == 3
+    assert session.feedback.state is STOPPED
+
+
+def test_stop_margin_timeout_accepts_pose_inside_requested_tolerance(robot):
+    robot.connect()
+    session = FakeClient.instances[-1].session
+    target = _action(0.0)
+    current = target.copy()
+    current["right_joint_5.pos"] = 0.1
+    within_requested_tolerance = target.copy()
+    within_requested_tolerance["right_joint_5.pos"] = 0.028841
+
+    with (
+        patch.object(
+            robot,
+            "_read_position_observation",
+            return_value=within_requested_tolerance,
+        ),
+        patch(
+            "lerobot_robot_oy_openarm.oy_openarm_follower.time.perf_counter",
+            side_effect=[0.0, 0.0, 0.0, 0.0, 1.0],
+        ),
+        patch("lerobot_robot_oy_openarm.oy_openarm_follower.time.sleep"),
+    ):
+        robot._align_arm_joints(
+            current=current,
+            target=target,
+            duration_s=0.001,
+            rate_hz=1000.0,
+            max_velocity_rad_s=1000.0,
+            position_tolerance_rad=math.radians(2.0),
+            settle_timeout_s=0.01,
+        )
+
+    assert session.feedback.state is STOPPED
+
+
+def test_stop_servo_session_rejects_failed_terminal_feedback(robot):
+    robot.connect()
+    session = FakeClient.instances[-1].session
+    robot._servo_session = session
+    failed_feedback = SimpleNamespace(
+        success=False,
+        message="gripper action did not stop",
+        state=FAILED,
+        last_received_sequence=7,
+        last_published_sequence=7,
+    )
+
+    def fail_stop(**_kwargs):
+        session.feedback = failed_feedback
+        session.is_closed = True
+        return failed_feedback
+
+    session.stop.side_effect = fail_stop
+    with pytest.raises(
+        RuntimeError,
+        match=r"未能正常停止.*state=FAILED.*gripper action did not stop",
+    ):
+        robot._stop_servo_session()
+
+    # A failed stop must never be mistaken for a detached, reusable state.
+    assert robot._servo_session is session
+    robot._servo_session = None
+
+
+def test_recording_action_starts_fresh_session_after_alignment(robot):
+    robot.connect()
+    client = FakeClient.instances[-1]
+    alignment_session = client.session
+    recording_session = FakeSession()
+    client.joint_servo.start.side_effect = [alignment_session, recording_session]
+    current = _action(0.0)
+    target = _action(0.0)
+    for key in target:
+        if "gripper" not in key:
+            target[key] = 0.1
+
+    with (
+        patch.object(
+            robot,
+            "_read_position_observation",
+            side_effect=[current, target, target],
+        ),
+        patch("lerobot_robot_oy_openarm.oy_openarm_follower.time.sleep"),
+    ):
+        robot.calibrate(
+            target,
+            duration_s=0.001,
+            rate_hz=1000.0,
+            max_velocity_rad_s=1000.0,
+            position_tolerance_rad=0.001,
+            settle_timeout_s=0.01,
+        )
+
+    robot.send_action(target)
+
+    assert client.joint_servo.start.call_count == 2
+    assert alignment_session.feedback.state is STOPPED
+    assert recording_session.send.call_count == 1
+    assert robot._servo_session is recording_session
 
 
 def test_calibrate_uses_millimetres_for_gripper_tolerance(robot):
@@ -457,7 +687,9 @@ def test_calibrate_reports_gripper_timeout_in_millimetres(robot):
 
     with (
         patch.object(
-            robot, "_read_position_observation", side_effect=[current, actual]
+            robot,
+            "_read_position_observation",
+            side_effect=[current, actual],
         ),
         patch("lerobot_robot_oy_openarm.oy_openarm_follower.time.sleep"),
         pytest.raises(

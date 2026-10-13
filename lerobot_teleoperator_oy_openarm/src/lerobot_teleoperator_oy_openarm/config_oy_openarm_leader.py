@@ -38,6 +38,12 @@ class OyOpenArmLeaderConfigBase:
     # Maximum duration of one complete eight-joint query per arm.
     timeout: float = 0.02
 
+    # Hot-plug recovery. A transient read/send failure closes both python-can
+    # sockets and retries until this window expires. Set timeout to zero to
+    # disable automatic recovery.
+    reconnect_timeout: float = 0.25
+    reconnect_interval: float = 0.02
+
     # Output consumed by OyOpenArmLeader.get_action(). Multi-turn radians are
     # the default and match the follower's radian action convention.
     unit: str = "rad"

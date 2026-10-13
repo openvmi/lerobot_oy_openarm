@@ -84,6 +84,12 @@ class OyOpenArmFollowerConfigBase:
     servo_ready_timeout: float = 15.0
     servo_stop_timeout: float = 5.0
 
+    # Alignment controls each gripper with one blocking end-effector action
+    # after the temporary arm-servo stream has stopped. Keep this timeout
+    # independent from the short query timeout because physical motion may
+    # legitimately take several seconds.
+    gripper_action_timeout: float = 15.0
+
     # Opt-in integration for the stock `lerobot-record`/`lerobot-teleoperate`
     # commands. Those commands connect the teleoperator before the robot, so
     # the follower can obtain the active OY leader's current action and align
@@ -107,17 +113,28 @@ class OyOpenArmFollowerConfig(RobotConfig, OyOpenArmFollowerConfigBase):
         super().__post_init__()
 
         if self.side not in (None, "both"):
-            raise ValueError("OyOpenArmFollower controls both arms; config.side must be None or 'both'.")
+            raise ValueError(
+                "OyOpenArmFollower controls both arms; config.side must be None or 'both'."
+            )
         if not self.ip.strip() or not self.port.strip():
             raise ValueError("config.ip and config.port must be non-empty strings.")
-        for name in ("connection_timeout", "rpc_timeout", "servo_ready_timeout", "servo_stop_timeout"):
+        for name in (
+            "connection_timeout",
+            "rpc_timeout",
+            "servo_ready_timeout",
+            "servo_stop_timeout",
+            "gripper_action_timeout",
+        ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"config.{name} must be positive.")
         if self.servo_publish_rate_hz < 0 or self.servo_command_timeout_ms < 0:
             raise ValueError("Servo rate and command timeout must be non-negative.")
 
         expected = {*(f"joint_{index}" for index in range(1, 8)), "gripper"}
-        for side, limits in (("left", self.left_joint_limits), ("right", self.right_joint_limits)):
+        for side, limits in (
+            ("left", self.left_joint_limits),
+            ("right", self.right_joint_limits),
+        ):
             if set(limits) != expected:
                 missing = sorted(expected - limits.keys())
                 unexpected = sorted(limits.keys() - expected)

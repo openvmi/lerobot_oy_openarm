@@ -62,6 +62,8 @@ class OyOpenArmLeader(Teleoperator):
             use_can_fd=config.use_can_fd,
             data_bitrate=config.can_data_bitrate,
             timeout=config.timeout,
+            reconnect_timeout=config.reconnect_timeout,
+            reconnect_interval=config.reconnect_interval,
             unit=config.unit,
             single_turn=config.single_turn,
             auto_configure_socketcan=config.auto_configure_socketcan,
@@ -118,19 +120,23 @@ class OyOpenArmLeader(Teleoperator):
 
         start = time.perf_counter()
         action = self.bus.read_positions()
-        if action.keys() != self.action_features.keys():
-            missing = self.action_features.keys() - action.keys()
-            unexpected = action.keys() - self.action_features.keys()
+        expected = OY_OPENARM_ACTION_FEATURES.keys()
+        if action.keys() != expected:
+            missing = expected - action.keys()
+            unexpected = action.keys() - expected
             raise RuntimeError(
                 f"OY OpenArm action schema mismatch: missing={sorted(missing)}, "
                 f"unexpected={sorted(unexpected)}"
             )
-        logger.debug("%s read action in %.1f ms", self, (time.perf_counter() - start) * 1e3)
+        elapsed_ms = (time.perf_counter() - start) * 1e3
+        logger.debug("%s read action in %.1f ms", self, elapsed_ms)
         return action
 
     @check_if_not_connected
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        raise NotImplementedError("Feedback is not implemented for the OY OpenArm leader.")
+        raise NotImplementedError(
+            "Feedback is not implemented for the OY OpenArm leader."
+        )
 
     @check_if_not_connected
     def disconnect(self) -> None:

@@ -74,7 +74,9 @@ class FakeCanBus:
             return
         direction = 1 if self.channel == "left-test" else -1
         multi_count = direction * joint_id * COUNTS_PER_TURN
-        payload = bytes([READ_ANGLE_COMMAND]) + struct.pack("<Hi", joint_id, multi_count)
+        payload = bytes([READ_ANGLE_COMMAND]) + struct.pack(
+            "<Hi", joint_id, multi_count
+        )
         self.pending.append(FakeMessage(joint_id, payload))
 
     def recv(self, timeout: float) -> FakeMessage | None:
@@ -83,6 +85,12 @@ class FakeCanBus:
 
     def shutdown(self) -> None:
         self.shutdown_called = True
+
+
+class FailingCanBus(FakeCanBus):
+    def send(self, request: FakeMessage, timeout: float) -> None:
+        del request, timeout
+        raise OSError("CAN adapter is temporarily unavailable")
 
 
 class FakeCanModule:
@@ -98,13 +106,36 @@ class FakeCanModule:
         return bus
 
 
-def make_response(joint_id: int, single_count: int, multi_count: int, **kwargs) -> FakeMessage:
-    payload = bytes([READ_ANGLE_COMMAND]) + struct.pack("<Hi", single_count, multi_count)
+class RecoveringCanModule(FakeCanModule):
+    """Fail the first pair of sockets and serve replies after reconnect."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.opened_buses: list[FakeCanBus] = []
+
+    def Bus(self, **kwargs) -> FakeCanBus:  # noqa: N802
+        if len(self.opened_buses) < 2:
+            bus = FailingCanBus(kwargs["channel"])
+        else:
+            bus = FakeCanBus(kwargs["channel"])
+        self.opened_buses.append(bus)
+        self.buses[kwargs["channel"]] = bus
+        return bus
+
+
+def make_response(
+    joint_id: int, single_count: int, multi_count: int, **kwargs
+) -> FakeMessage:
+    payload = bytes([READ_ANGLE_COMMAND]) + struct.pack(
+        "<Hi", single_count, multi_count
+    )
     return FakeMessage(joint_id, payload, **kwargs)
 
 
 def test_decode_angle_response() -> None:
-    sample = decode_angle_response(make_response(3, COUNTS_PER_TURN // 2, -COUNTS_PER_TURN))
+    sample = decode_angle_response(
+        make_response(3, COUNTS_PER_TURN // 2, -COUNTS_PER_TURN)
+    )
     assert sample is not None
     assert sample.joint_id == 3
     assert sample.angle("deg", single_turn=True) == pytest.approx(180.0)
@@ -162,11 +193,38 @@ def test_bus_rejects_incomplete_action(monkeypatch) -> None:
         can_interface="virtual",
         auto_configure_socketcan=False,
         timeout=0.001,
+        reconnect_timeout=0,
     )
     bus.connect()
     with pytest.raises(TimeoutError, match="left_gripper.pos"):
         bus.read_positions()
     bus.disconnect()
+
+
+def test_bus_reopens_sockets_after_transient_can_failure(monkeypatch) -> None:
+    fake_can = RecoveringCanModule()
+    monkeypatch.setattr(f"{_BUS_MODULE}._load_python_can", lambda: fake_can)
+    monkeypatch.setattr(f"{_BUS_MODULE}.time.sleep", lambda _seconds: None)
+    bus = OyOpenArmBus(
+        "left-test",
+        "right-test",
+        can_interface="virtual",
+        auto_configure_socketcan=False,
+        reconnect_timeout=0.25,
+        reconnect_interval=0.001,
+    )
+
+    bus.connect()
+    positions = bus.read_positions()
+
+    assert positions["left_joint_1.pos"] == pytest.approx(math.tau)
+    assert positions["right_joint_1.pos"] == pytest.approx(-math.tau)
+    assert len(fake_can.opened_buses) == 4
+    assert all(bus.shutdown_called for bus in fake_can.opened_buses[:2])
+    assert all(not bus.shutdown_called for bus in fake_can.opened_buses[2:])
+
+    bus.disconnect()
+    assert all(bus.shutdown_called for bus in fake_can.opened_buses)
 
 
 def test_leader_lifecycle_and_get_action(tmp_path) -> None:
@@ -178,7 +236,10 @@ def test_leader_lifecycle_and_get_action(tmp_path) -> None:
             self.is_connected = True
 
         def read_positions(self) -> dict[str, float]:
-            return {key: float(index) for index, key in enumerate(OY_OPENARM_ACTION_FEATURES)}
+            return {
+                key: float(index)
+                for index, key in enumerate(OY_OPENARM_ACTION_FEATURES)
+            }
 
         def disconnect(self) -> None:
             self.is_connected = False

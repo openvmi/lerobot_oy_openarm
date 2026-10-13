@@ -116,7 +116,9 @@ def socketcan_is_up(channel: str) -> bool:
     except FileNotFoundError as error:
         raise RuntimeError(f"SocketCAN channel {channel!r} does not exist") from error
     except (OSError, ValueError) as error:
-        raise RuntimeError(f"Could not read state for SocketCAN channel {channel!r}: {error}") from error
+        raise RuntimeError(
+            f"Could not read state for SocketCAN channel {channel!r}: {error}"
+        ) from error
     return bool(flags & SOCKETCAN_INTERFACE_UP)
 
 
@@ -139,7 +141,9 @@ def ensure_socketcan_up(
 
     ip_program = shutil.which("ip")
     if ip_program is None:
-        raise RuntimeError(f"Cannot configure {channel!r}: the 'ip' command is not installed")
+        raise RuntimeError(
+            f"Cannot configure {channel!r}: the 'ip' command is not installed"
+        )
     prefix: list[str] = []
     if os.geteuid() != 0:
         sudo_program = shutil.which("sudo")
@@ -149,10 +153,22 @@ def ensure_socketcan_up(
             )
         prefix = [sudo_program]
 
-    type_command = [*prefix, ip_program, "link", "set", channel, "type", "can", "bitrate", str(bitrate)]
+    type_command = [
+        *prefix,
+        ip_program,
+        "link",
+        "set",
+        channel,
+        "type",
+        "can",
+        "bitrate",
+        str(bitrate),
+    ]
     if use_can_fd:
         if data_bitrate is None or data_bitrate <= 0:
-            raise ValueError("A positive data_bitrate is required when CAN FD is enabled")
+            raise ValueError(
+                "A positive data_bitrate is required when CAN FD is enabled"
+            )
         type_command.extend(["dbitrate", str(data_bitrate), "fd", "on"])
     type_command.extend(["restart-ms", "100"])
 
@@ -171,7 +187,9 @@ def ensure_socketcan_up(
             ) from error
 
     if not socketcan_is_up(channel):
-        raise RuntimeError(f"Configured SocketCAN channel {channel!r}, but it is still down")
+        raise RuntimeError(
+            f"Configured SocketCAN channel {channel!r}, but it is still down"
+        )
     return True
 
 
@@ -189,6 +207,8 @@ class OyOpenArmBus:
         data_bitrate: int | None = None,
         joint_ids: tuple[int, ...] = DEFAULT_JOINT_IDS,
         timeout: float = 0.02,
+        reconnect_timeout: float = 0.25,
+        reconnect_interval: float = 0.02,
         unit: str = "rad",
         single_turn: bool = False,
         auto_configure_socketcan: bool = True,
@@ -197,16 +217,25 @@ class OyOpenArmBus:
             raise ValueError("Left and right arms must use different CAN channels")
         if not joint_ids or len(set(joint_ids)) != len(joint_ids):
             raise ValueError("joint_ids must be non-empty and unique")
-        if any(not isinstance(joint_id, int) or not 1 <= joint_id <= 254 for joint_id in joint_ids):
+        if any(
+            not isinstance(joint_id, int) or not 1 <= joint_id <= 254
+            for joint_id in joint_ids
+        ):
             raise ValueError("Every joint ID must be an integer in [1, 254]")
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be a finite positive number")
+        if not math.isfinite(reconnect_timeout) or reconnect_timeout < 0:
+            raise ValueError("reconnect_timeout must be a finite non-negative number")
+        if not math.isfinite(reconnect_interval) or reconnect_interval <= 0:
+            raise ValueError("reconnect_interval must be a finite positive number")
         if bitrate <= 0:
             raise ValueError("bitrate must be positive")
         if unit not in {"rad", "deg"}:
             raise ValueError("unit must be 'rad' or 'deg'")
         if can_interface not in {"auto", "socketcan", "slcan", "pcan", "virtual"}:
-            raise ValueError("can_interface must be one of: auto, socketcan, slcan, pcan, virtual")
+            raise ValueError(
+                "can_interface must be one of: auto, socketcan, slcan, pcan, virtual"
+            )
 
         self.channels = {"left": left_port, "right": right_port}
         self.can_interface = can_interface
@@ -215,6 +244,8 @@ class OyOpenArmBus:
         self.data_bitrate = data_bitrate
         self.joint_ids = tuple(joint_ids)
         self.timeout = timeout
+        self.reconnect_timeout = reconnect_timeout
+        self.reconnect_interval = reconnect_interval
         self.unit = unit
         self.single_turn = single_turn
         self.auto_configure_socketcan = auto_configure_socketcan
@@ -245,9 +276,14 @@ class OyOpenArmBus:
                 data_bitrate=self.data_bitrate,
             )
             if started:
-                logger.info("Started SocketCAN channel %s at %d bit/s", channel, self.bitrate)
+                logger.info(
+                    "Started SocketCAN channel %s at %d bit/s", channel, self.bitrate
+                )
 
-        filters = [{"can_id": joint_id, "can_mask": 0x7FF, "extended": False} for joint_id in self.joint_ids]
+        filters = [
+            {"can_id": joint_id, "can_mask": 0x7FF, "extended": False}
+            for joint_id in self.joint_ids
+        ]
         kwargs: dict[str, Any] = {
             "interface": interface,
             "channel": channel,
@@ -262,18 +298,25 @@ class OyOpenArmBus:
                 kwargs["data_bitrate"] = self.data_bitrate
         return self._can.Bus(**kwargs)
 
+    def _connect_unlocked(self) -> None:
+        """Open both CAN sockets and their shared reader pool."""
+
+        self._can = _load_python_can()
+        try:
+            for side, channel in self.channels.items():
+                self._buses[side] = self._open_bus(channel)
+            self._executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="oy-openarm"
+            )
+        except BaseException:
+            self._shutdown_unlocked()
+            raise
+
     def connect(self) -> None:
         with self._lock:
             if self.is_connected:
                 raise RuntimeError("OY OpenArm CAN bus is already connected")
-            self._can = _load_python_can()
-            try:
-                for side, channel in self.channels.items():
-                    self._buses[side] = self._open_bus(channel)
-                self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="oy-openarm")
-            except BaseException:
-                self._shutdown_unlocked()
-                raise
+            self._connect_unlocked()
             logger.info(
                 "Connected OY OpenArm leader buses: left=%s, right=%s",
                 self.channels["left"],
@@ -288,13 +331,17 @@ class OyOpenArmBus:
             drain_deadline = time.monotonic() + self.timeout
             while bus.recv(timeout=0) is not None:
                 if time.monotonic() >= drain_deadline:
-                    raise RuntimeError("receive queue remained busy while discarding stale replies")
+                    raise RuntimeError(
+                        "receive queue remained busy while discarding stale replies"
+                    )
 
             deadline = time.monotonic() + self.timeout
             for joint_id in self.joint_ids:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("sending angle requests exceeded the read timeout")
+                    raise TimeoutError(
+                        "sending angle requests exceeded the read timeout"
+                    )
                 request = self._can.Message(
                     arbitration_id=0x100 | joint_id,
                     is_extended_id=False,
@@ -316,7 +363,9 @@ class OyOpenArmBus:
                     samples.setdefault(sample.joint_id, sample)
             return tuple(samples.get(joint_id) for joint_id in self.joint_ids)
         except Exception as error:
-            raise RuntimeError(f"Failed reading {side} arm on {self.channels[side]}: {error}") from error
+            raise RuntimeError(
+                f"Failed reading {side} arm on {self.channels[side]}: {error}"
+            ) from error
 
     def read_joint_angles(self) -> dict[str, tuple[JointAngle | None, ...]]:
         """Query both arms concurrently, ordered according to ``joint_ids``."""
@@ -324,21 +373,21 @@ class OyOpenArmBus:
         with self._lock:
             if not self.is_connected or self._executor is None:
                 raise RuntimeError("OY OpenArm CAN bus is not connected")
-            futures = {side: self._executor.submit(self._read_arm, side) for side in ARM_SIDES}
+            futures = {
+                side: self._executor.submit(self._read_arm, side) for side in ARM_SIDES
+            }
             results: dict[str, tuple[JointAngle | None, ...]] = {}
-            errors: list[BaseException] = []
+            errors: list[Exception] = []
             for side, future in futures.items():
                 try:
                     results[side] = future.result()
-                except BaseException as error:
+                except Exception as error:
                     errors.append(error)
             if errors:
                 raise errors[0]
             return results
 
-    def read_positions(self) -> dict[str, float]:
-        """Return a flat, complete LeRobot action dictionary for both arms."""
-
+    def _read_positions_once(self) -> dict[str, float]:
         samples = self.read_joint_angles()
         positions: dict[str, float] = {}
         missing: list[str] = []
@@ -351,8 +400,64 @@ class OyOpenArmBus:
                 else:
                     positions[feature] = sample.angle(self.unit, self.single_turn)
         if missing:
-            raise TimeoutError(f"Timed out waiting for OY OpenArm joints: {', '.join(missing)}")
+            raise TimeoutError(
+                f"Timed out waiting for OY OpenArm joints: {', '.join(missing)}"
+            )
         return positions
+
+    def _reconnect(self) -> None:
+        """Replace stale CAN sockets without changing motor state or zero points."""
+
+        with self._lock:
+            self._shutdown_unlocked()
+            self._connect_unlocked()
+
+    def read_positions(self) -> dict[str, float]:
+        """Read both arms, recovering briefly from CAN hot-plug transients."""
+
+        recovery_deadline: float | None = None
+        attempts = 0
+        first_error: Exception | None = None
+        while True:
+            try:
+                positions = self._read_positions_once()
+                if attempts:
+                    logger.info(
+                        "OY OpenArm leader CAN communication recovered after %d reconnect attempt(s)",
+                        attempts,
+                    )
+                return positions
+            except (RuntimeError, TimeoutError, OSError) as error:
+                if self.reconnect_timeout == 0:
+                    raise
+                if recovery_deadline is None:
+                    first_error = error
+                    recovery_deadline = time.monotonic() + self.reconnect_timeout
+
+                remaining = recovery_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "OY OpenArm leader CAN recovery timed out after "
+                        f"{attempts} reconnect attempt(s); first error: {first_error}; "
+                        f"last error: {error}"
+                    ) from error
+
+                attempts += 1
+                logger.warning(
+                    "OY OpenArm leader CAN read failed (%s); reconnecting sockets "
+                    "(%d, %.0f ms remaining)",
+                    error,
+                    attempts,
+                    remaining * 1000.0,
+                )
+                time.sleep(min(self.reconnect_interval, remaining))
+                try:
+                    self._reconnect()
+                except (RuntimeError, OSError, ValueError) as reconnect_error:
+                    logger.warning(
+                        "OY OpenArm leader CAN socket reconnect failed: %s",
+                        reconnect_error,
+                    )
 
     def _shutdown_unlocked(self) -> None:
         executor, self._executor = self._executor, None
